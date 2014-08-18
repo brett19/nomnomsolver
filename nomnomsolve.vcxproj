@@ -156,6 +156,8 @@
       <Optimization>Full</Optimization>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <OpenMPSupport>true</OpenMPSupport>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -178,7 +180,6 @@
     <ClInclude Include="tests.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="crc32.cpp" />
     <ClCompile Include="nomnomsolve.cpp" />
     <ClCompile Include="stdafx.cpp" />
   </ItemGroup>

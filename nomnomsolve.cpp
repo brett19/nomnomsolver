@@ -12,79 +12,69 @@
 #include <assert.h>
 #include <boost/pool/object_pool.hpp>
 
-unsigned __int32 crc32_8bytes(const void* data, size_t length, unsigned __int32 previousCrc32 = 0);
-unsigned __int32 crc32_4bytes(const void* data, size_t length, unsigned __int32 previousCrc32 = 0);
+typedef unsigned __int8 uint8_t;
+typedef unsigned __int16 uint16_t;
+typedef unsigned __int32 uint32_t;
+typedef unsigned __int64 uint64_t;
 
-#define FASTGRID 1
-#define TRACKPARENTS 1
-#define CULLMAP 0
-#define CULLLIST 0
-#define CULLBMAP 1
-#define RETRACEUP 0
+#define TRACKPARENTS 1 // Whether to keep track of parents and print full game solutions (costs memory)
+#define ESTIMBEST 400 // The estimated best move count
+#define MAXCOST 256 // The highest possible cost returned from the heuristic
+#define TESTNUMBER 9 // The test to run
+#define MAXPLRS 4 // The most players possible in a single game
+#define MAXSTACK 6 // Used for optimizing around maximum stacked items
+#define CULLBMAP 1 // Use Seen Map
+#define THREADBATCH 10000
 
-#define MAXCOST 256
-
-#if FASTGRID
-typedef unsigned char GRID[4][6];
-#define GV(itm, num) ((itm&0x1F)|((num&0x7)<<5))
+typedef uint8_t GRID[4][6];
+#define GV(itm, num) (itm|(num<<5))
 #define GI(id,y,x) (id[y][x]&0x1F)
-#define GN(id,y,x) ((id[y][x]>>5)&0x7)
+#define GN(id,y,x) (id[y][x]>>5)
 #define GE(id,y,x) (id[y][x]==0)
-#else
-typedef unsigned char GRID[4][6][2];
-#define GV(itm, num) {itm,num}
-#define GI(id) id[0]
-#define GN(id) id[1]
-#define GE(id) (id[1]==0)
-#endif
-
-unsigned int powCount = 0;
-unsigned int poofCount = 0;
-unsigned int earlyCount = 0;
+#define GS(id,y,x,itm,num) id[y][x]=GV(itm,num)
+#define GR(id,y,x) id[y][x]=0
 
 template<typename T>
 class cppalloc {
 public:
-    T * malloc() {
-        return new T;
-    }
-    void free(T * p) {
-        delete p;
-    }
+    T * malloc() { return (T*)new T; }
+    void free(T * p) { delete p; }
 };
 
 template<typename T>
 class boostalloc {
     boost::object_pool<T> ba;
 public:
-    T * malloc() {
-        return ba.malloc();
-    }
-    void free(T * p) {
-        ba.free(p);
-    }
+    T * malloc() { return ba.malloc(); }
+    void free(T * p) { ba.free(p); }
 };
 
 
 cppalloc<class AStarOpen> nodePool;
-//boostalloc<class AStarOpen> nodePool;
-boost::object_pool<GRID> gridPool;
+cppalloc<GRID> gridPool;
+
+#include "tests.h"
+
+uint32_t lastStatus = 0;
+volatile unsigned long powCount = 0;
+volatile unsigned long poofCount = 0;
+volatile unsigned long earlyCount = 0;
+volatile unsigned long testCount = 0;
+volatile unsigned long solutionCount = 0;
+volatile unsigned long pendCount = 0;
+
+class GridCmp {
+public:
+    bool operator()(const GRID* a, const GRID* b) {
+        return memcmp(a, b, sizeof(GRID)) < 0;
+    }
+};
 
 class AStarOpen {
 public:
-#if TRACKPARENTS
-    AStarOpen() : mindist(0), moves(0), refcount(1), parent(nullptr) {}
-#else
-    AStarOpen() : mindist(0), moves(0), refcount(1) {}
-#endif
-
-    ~AStarOpen() {
-    }
-
     GRID grd;
 
-    unsigned int refcount;
-    //unsigned char dist;
+    volatile unsigned long refcount;
     unsigned char mindist;
     unsigned char moves;
 
@@ -92,8 +82,12 @@ public:
     AStarOpen *parent;
 #endif // TRACKPARENTS
 
-    void addref() { refcount++; }
+    void addref() {
+#pragma omp atomic
+        refcount++;
+    }
     void decref() {
+#pragma omp atomic
         refcount--;
         if (refcount == 0) {
 #if TRACKPARENTS
@@ -103,19 +97,27 @@ public:
             }
 #endif
             nodePool.free(this);
+#pragma omp atomic
             poofCount++;
         }
     }
-    
+
 };
-typedef std::list<AStarOpen*> AStarOpenList;
 
+typedef std::map<GRID*, uint8_t, GridCmp> GRIDBMAP;
+typedef std::deque<AStarOpen*> OPENLISTGRP;
+typedef std::vector<AStarOpen*> OPENLIST;
+GRIDBMAP seenBMap;
+OPENLISTGRP openListX[MAXCOST];
+volatile unsigned long lowOpenCost = MAXCOST;
+volatile unsigned long fastestFound = ESTIMBEST;
 
-int fastestFound = 400;
-
-#define TESTNUMBER 10
-#include "tests.h"
-
+struct ThreadData {
+    OPENLIST curOpenList;
+    OPENLIST newOpenList;
+    GRIDBMAP seenList;
+} *tdata;
+#pragma omp threadprivate(tdata)
 
 const int pxs[5][4][2][2] = {
     {
@@ -147,167 +149,39 @@ const int pxs[5][4][2][2] = {
 };
 
 
-int startTime;
+uint32_t startTime;
 int xtime() {
     return GetTickCount() - startTime;
 }
 
-void copyGrid(GRID& in, GRID& out) {
-    memcpy(&out, &in, sizeof(GRID));
+void copyGrid(GRID& dest, const GRID& src) {
+    memcpy(&dest, &src, sizeof(GRID));
 }
 
 bool checkWin(GRID& in) {
-    for (int iq = 0; iq < ttlPlyrs; ++iq) {
-        int px1 = pxs[ttlPlyrs][iq][0][0];
-        int py1 = pxs[ttlPlyrs][iq][0][1];
-        int px2 = pxs[ttlPlyrs][iq][1][0];
-        int py2 = pxs[ttlPlyrs][iq][1][1];
+    for (int iq = 0; iq < TTLPLAYRS; ++iq) {
+        const int px1 = pxs[TTLPLAYRS][iq][0][0];
+        const int py1 = pxs[TTLPLAYRS][iq][0][1];
+        const int px2 = pxs[TTLPLAYRS][iq][1][0];
+        const int py2 = pxs[TTLPLAYRS][iq][1][1];
+        const uint8_t i1i = i[iq][0][0];
+        const uint8_t i1n = i[iq][0][1];
+        const uint8_t i2i = i[iq][1][0];
+        const uint8_t i2n = i[iq][1][1];
 
-        if ((GI(in,py1,px1) == i[iq][0][0] && GN(in,py1,px1) == i[iq][0][1] && GI(in,py2,px2) == i[iq][1][0] && GN(in,py2,px2) == i[iq][1][1]) ||
-            (GI(in,py2,px2) == i[iq][0][0] && GN(in,py2,px2) == i[iq][0][1] && GI(in,py1,px1) == i[iq][1][0] && GN(in,py1,px1) == i[iq][1][1])) {
-            // Matches so far...
-        } else {
-            return false;
-        }
+        if (GI(in,py1,px1) != i1i && GI(in,py1,px1) != i2i) return false;
+        if (GI(in,py2,px2) != i2i && GI(in,py2,px2) != i1i) return false;
+
+        if (GN(in,py1,px1) != i1n && GN(in,py1,px1) != i2n) return false;
+        if (GN(in,py2,px2) != i2n && GN(in,py2,px2) != i1n) return false;
     }
     return true;
 }
 
-typedef std::unordered_map<unsigned int, unsigned char> HASHMAP;
-
-int testCount = 0;
-HASHMAP hasSeen;
-//AStarOpenList openList;
-int solutionCount = 0;
-
-struct SeenGrid {
-    SeenGrid(GRID& _grd, unsigned int _moves)
-        : moves(_moves) {
-            memcpy(&grd, &_grd, sizeof(GRID));
-    }
-
-    GRID grd;
-    unsigned int moves;
-};
-
-class GridCmp {
-public:
-    typedef unsigned __int64 uint64_t;
-    bool operator()(const GRID* a, const GRID* b) {
-       return memcmp(a, b, sizeof(GRID)) < 0;
-    }
-};
-
-std::map<unsigned __int64, std::vector<SeenGrid>> seenGrids;
-typedef std::map<GRID*, unsigned char, GridCmp> GRIDBMAP;
-GRIDBMAP seenBMap;
-typedef std::deque<AStarOpen*> OPENLISTGRP;
-OPENLISTGRP openListX[MAXCOST];
-int lowOpenCost = 256;
-
-unsigned __int64 gridHashKey(GRID& in) {
-    unsigned char *bytes = (unsigned char*)&in;
-    unsigned __int64 hash = bytes[0] & 3;
-    for (int i = 1; i < 21; ++i) {
-        hash = (hash << 3) | (bytes[i] & 7);
-    }
-    return hash;
-}
-
-unsigned int hashGrid(GRID& in) {
-    return crc32_4bytes(&in, sizeof(GRID));
-}
-
 void moveItem(GRID& in, int fx, int fy, int tx, int ty) {
-#if FASTGRID
-    in[ty][tx] = GV(GI(in,fy,fx), GN(in,fy,fx)+GN(in,ty,tx));
-    in[fy][fx] = 0;
-#else
-    in[ty][tx][0] = in[fy][fx][0];
-    in[ty][tx][1] += in[fy][fx][1];
-    in[fy][fx][0] = 0;
-    in[fy][fx][1] = 0;
-#endif
+    GS(in,ty,tx, GI(in,fy,fx), GN(in,fy,fx)+GN(in,ty,tx));
+    GR(in,fy,fx);
 }
-
-#define XYB(x, y) (1<<(y*6+x))
-
-#if 0
-void findClosestItem(GRID& in, int& minCost, int& rCost, int sx, int sy, int itm, int& foundNum, unsigned int &ignore) {
-    int bestDist = 10000;
-    int foundExtra = 0;
-    int bestX = 0;
-    int bestY = 0;
-    for (int iy = 0; iy < 4; ++iy) {
-        for (int ix = 0; ix < 6; ++ix) {
-            if (ignore & XYB(ix,iy)) {
-                continue;
-            }
-
-            if (GI(in,iy,ix) == itm) {
-                int fDist = abs(ix-sx) + abs(iy-sy);
-                if (fDist < bestDist) {
-                    bestDist = fDist;
-                    foundExtra = GN(in,iy,ix) - 1;
-                    bestX = ix;
-                    bestY = iy;
-                }
-            }
-        }
-    }
-    assert(bestDist < 4 + 6);
-
-    foundNum = foundExtra;
-    ignore |= XYB(bestX, bestY);
-
-    
-
-#if 1
-    minCost += bestDist;
-    rCost += bestDist;
-#else
-    minCost += bestDist;
-    rCost += bestDist * 2;
-
-    if (bestX < sx) {
-        std::swap(bestX, sx);
-    }
-    for (int ix = sx; ix < bestX; ++ix) {
-        bool foundHole = false;
-        for (int iy = -1; iy <= 1; ++iy) {
-            if (bestY+iy < 0 || bestY+iy >= 4) {
-                continue;
-            }
-            if (GE(in, ix, bestY+iy)) {
-                foundHole = true;
-                break;
-            }
-        }
-        if (!foundHole) {
-            rCost++;
-        }
-    }
-#endif
-}
-
-unsigned int gnoSearch;
-void findClosestItem(GRID& in, int& minCost, int& rCost, int sx, int sy, int itm, int num) {
-    gnoSearch = 0;
-#if 1
-    int totalDist = 0;
-    int foundExtra = 0;
-    assert(num <= 7);
-    for (int i = 0; i < num; ++i) {
-        findClosestItem(in, minCost, rCost, sx, sy, itm, foundExtra, gnoSearch);
-        i += foundExtra;
-    }
-#else
-    findClosestItem(in, minCost, rCost, sx, sy, itm, gnoSearch);
-#endif
-}
-
-#else
-#endif
 
 void printBoard(GRID& in, AStarOpen *parent);
 
@@ -317,14 +191,21 @@ struct FoundItem {
     char num;
 };
 
-#define MAXPLRS 4
-#define MAXSTACK 6
-
 int findClosestItem(const FoundItem *list, int numList, unsigned int ignore, int dist, int bDist, int sx, int sy, int num);
 
-unsigned char cacheTable2[MAXSTACK] [2][4] [6][4][MAXSTACK] [6][4][MAXSTACK];
-unsigned char cacheTable3[MAXSTACK] [2][4] [6][4][MAXSTACK] [6][4][MAXSTACK] [6][4][MAXSTACK];
+struct CacheTables {
+    unsigned char t2[MAXSTACK] [2][4] [6][4][MAXSTACK] [6][4][MAXSTACK];
+    unsigned char t3[MAXSTACK] [2][4] [6][4][MAXSTACK] [6][4][MAXSTACK] [6][4][MAXSTACK];
+} caches;
+
 void buildTable() {
+    FILE *rfh = fopen("table.cache", "rb");
+    if (rfh != NULL) {
+        fread(&caches, sizeof(CacheTables), 1, rfh);
+        fclose(rfh);
+        return;
+    }
+
     int xlkp[] = { 0, 5 };
     FoundItem itms[3];
 
@@ -346,7 +227,7 @@ void buildTable() {
                                     for (int in2 = 0; in2 < MAXSTACK; ++in2) {
                                         itms[1].num = in2;
 
-                                        cacheTable2[tn][_sx][sy][ix1][iy1][in1][ix2][iy2][in2] = 
+                                        caches.t2[tn][_sx][sy][ix1][iy1][in1][ix2][iy2][in2] = 
                                             findClosestItem(itms, 2, 0, 0, -1, sx, sy, tn);
 
                                         for (int ix3 = 0; ix3 < 6; ++ix3) {
@@ -356,7 +237,7 @@ void buildTable() {
                                                 for (int in3 = 0; in3 < MAXSTACK; ++in3) {
                                                     itms[2].num = in2;
 
-                                                    cacheTable3[tn][_sx][sy][ix1][iy1][in1][ix2][iy2][in2][ix3][iy3][in3] = 
+                                                    caches.t3[tn][_sx][sy][ix1][iy1][in1][ix2][iy2][in2][ix3][iy3][in3] = 
                                                         findClosestItem(itms, 3, 0, 0, -1, sx, sy, tn);
                                                 }
                                             }
@@ -371,6 +252,12 @@ void buildTable() {
             }
         }
     }
+
+    FILE *wfh = fopen("table.cache", "wb");
+    if (wfh != NULL) {
+       fwrite(&caches, sizeof(CacheTables), 1, wfh);
+        fclose(wfh);
+    }
 }
 
 int findClosestItem(const FoundItem *list, int numList, unsigned int ignore, int dist, int bDist, int sx, int sy, int num) {
@@ -378,7 +265,7 @@ int findClosestItem(const FoundItem *list, int numList, unsigned int ignore, int
     unsigned int key = 1;
     const FoundItem *mlist = list;
     for (; mlist->num > 0; mlist++, key <<= 1) {
-        if (ignore & key) continue;
+        if (ignore&key) continue;
         const FoundItem& itm = *mlist;
 
         int nnum = num - itm.num;
@@ -390,7 +277,7 @@ int findClosestItem(const FoundItem *list, int numList, unsigned int ignore, int
             continue;
         }
 
-        int xdist = findClosestItem(list, numList, ignore | key, dist+ndist, bestDist, itm.x, itm.y, nnum);
+        int xdist = findClosestItem(list, numList, ignore|key, dist+ndist, bestDist, itm.x, itm.y, nnum);
         if (xdist >= 0 && (bestDist == -1 || xdist < bestDist)) {
             bestDist = xdist;
         }
@@ -399,33 +286,42 @@ int findClosestItem(const FoundItem *list, int numList, unsigned int ignore, int
 }
 
 int findClosestItemFast(const FoundItem *list, int numList, unsigned int ignore, int dist, int bDist, int sx, int sy, int num) {
+#if 1
+    const int xlkp[] = {0, -1, -1, -1, -1, 5};
     if (numList == 1) {
-        return abs(sx-list->x) + abs(sy-list->y);
+        if (list->num == num) {
+            return abs(sx-list->x) + abs(sy-list->y);
+        } else {
+            return -1;
+        }
     } else if (numList == 2) {
-        return cacheTable2[num]
-            [sx==0?0:1][sy]
+        return caches.t2[num]
+            [xlkp[sx]][sy]
             [list[0].x][list[0].y][list[0].num]
             [list[1].x][list[1].y][list[1].num];
     } else if (numList == 3) {
-        return cacheTable3[num]
-            [sx==0?0:1][sy]
+        return caches.t3[num]
+            [xlkp[sx]][sy]
             [list[0].x][list[0].y][list[0].num]
             [list[1].x][list[1].y][list[1].num]
             [list[2].x][list[2].y][list[2].num];
     } else {
         return findClosestItem(list, numList, ignore, dist, bDist, sx, sy, num);
     }
+#else
+    return findClosestItem(list, numList, ignore, dist, bDist, sx, sy, num);
+#endif
 }
 
 int findClosestPlrItem(const GRID& in, int iq) {
-    int sx1 = pxs[ttlPlyrs][iq][0][0];
-    int sy1 = pxs[ttlPlyrs][iq][0][1];
-    int itm1 = i[iq][0][0];
-    int num1 = i[iq][0][1];
-    int sx2 = pxs[ttlPlyrs][iq][1][0];
-    int sy2 = pxs[ttlPlyrs][iq][1][1];
-    int itm2 = i[iq][1][0];
-    int num2 = i[iq][1][1];
+    const int sx1 = pxs[TTLPLAYRS][iq][0][0];
+    const int sy1 = pxs[TTLPLAYRS][iq][0][1];
+    const int itm1 = i[iq][0][0];
+    const int num1 = i[iq][0][1];
+    const int sx2 = pxs[TTLPLAYRS][iq][1][0];
+    const int sy2 = pxs[TTLPLAYRS][iq][1][1];
+    const int itm2 = i[iq][1][0];
+    const int num2 = i[iq][1][1];
 
     int itemCnt1 = 0;
     FoundItem items1[MAXSTACK];
@@ -476,7 +372,7 @@ int findClosestPlrItem(const GRID& in, int iq) {
 
 int calcDist(const GRID& in) {
     int ttlCost = 0;
-    for (int iq = 0; iq < ttlPlyrs; ++iq) {
+    for (int iq = 0; iq < TTLPLAYRS; ++iq) {
         int cost = findClosestPlrItem(in, iq);
         if (cost == -1) {
             return -1;
@@ -514,8 +410,8 @@ void printBoard(GRID& in, AStarOpen *parent) {
     }
 }
 
-void recursePrintBoard(AStarOpen *itm) {
 #if TRACKPARENTS
+void recursePrintBoard(AStarOpen *itm) {
     if (itm->parent) {
         recursePrintBoard(itm->parent);
     }
@@ -523,14 +419,62 @@ void recursePrintBoard(AStarOpen *itm) {
     printf("\\_____________________________________/\n");
     printBoard(itm->grd, itm->parent);
     printf("\\_____________________________________/ \\_____________________________________/\n");
+}
 #else
+void recursePrintBoard(AStarOpen *itm) {
     printf("\\_____________________________________/\n");
     printBoard(itm->grd, nullptr);
     printf("\\_____________________________________/\n");
-#endif
 }
+#endif
 
-void addToOpen(GRID& grd, unsigned int moves, AStarOpen *parent) {
+#if CULLBMAP && _OPENMP
+__forceinline bool wasGridSeen(const GRID& grd, int moves) {
+    GRIDBMAP::iterator seenItm = seenBMap.find((GRID*)&grd);
+    if (seenItm != seenBMap.end()) {
+        if (seenItm->second <= moves) {
+            return true;
+        }
+        seenItm->second = moves;
+        return false;
+    }
+    seenItm = tdata->seenList.find((GRID*)&grd);
+    if (seenItm != tdata->seenList.end()) {
+        if (seenItm->second <= moves) {
+            return true;
+        }
+        seenItm->second = moves;
+        return false;
+    }
+
+    GRID *ngrid = gridPool.malloc();
+    memcpy(ngrid, &grd, sizeof(GRID));
+    tdata->seenList.insert(std::pair<GRID*,unsigned int>(ngrid, moves));
+    return false;
+}
+#elif CULLBMAP
+__forceinline bool wasGridSeen(const GRID& grd, int moves) {
+    GRIDBMAP::iterator seenItm = seenBMap.find((GRID*)&grd);
+    if (seenItm != seenBMap.end()) {
+        //assert(memcmp(seenItm->first, &itm.grd, sizeof(GRID)) == 0);
+        if (seenItm->second <= moves) {
+            return true;
+        }
+        seenItm->second = moves;
+    } else {
+        GRID *ngrid = gridPool.malloc();
+        memcpy(ngrid, &grd, sizeof(GRID));
+        seenBMap.insert(std::pair<GRID*,unsigned int>(ngrid, moves));
+    }
+    return false;
+}
+#else
+__forceinline bool wasGridSeen(const GRID& grd, int moves) {
+    return false;
+}
+#endif
+
+void addToOpen(const GRID& grd, unsigned int moves, AStarOpen *parent) {
     int minCost = calcDist(grd);
     if (minCost == -1) {
         earlyCount++;
@@ -538,103 +482,55 @@ void addToOpen(GRID& grd, unsigned int moves, AStarOpen *parent) {
     }
 
     assert(minCost >= 0 && minCost < MAXCOST);
+    assert(moves + minCost < MAXCOST);
 
-    if (moves+minCost < fastestFound) {
-#if CULLMAP
-        unsigned int hashTag = hashGrid(itm.grd);
-        HASHMAP::iterator prevSeen = hasSeen.find(hashTag);
-        if (prevSeen != hasSeen.end()) {
-            if (itm.moves >= prevSeen->second) {
-                itm->decref();
-                earlyCount++;
-                return;
-            }
-            prevSeen->second = itm.moves;
-        } else {
-            hasSeen.insert(std::pair<unsigned int, unsigned char>(hashTag, itm.moves));
-        }
-#endif
-#if CULLLIST
-        unsigned __int64 hashKey = gridHashKey(itm.grd);
-        std::vector<SeenGrid>& hashGrids = seenGrids[hashKey];
-        bool foundMatch = false;
-        for (std::vector<SeenGrid>::iterator i = hashGrids.begin(); i != hashGrids.end(); ++i) {
-            if (memcmp(&i->grd, &itm.grd, sizeof(GRID)) == 0) {
-                if (i->moves < itm.moves) {
-                    itm->decref();
-                    earlyCount++;
-                    return;
-                }
-                i->moves = itm.moves;
-                foundMatch = true;
-                break;
-            }
-        }
-        if (!foundMatch) {
-            hashGrids.push_back(SeenGrid(itm.grd, itm.moves));
-        }
-#endif
-#if CULLBMAP
-        GRIDBMAP::iterator seenItm = seenBMap.find(&grd);
-        if (seenItm != seenBMap.end()) {
-            //assert(memcmp(seenItm->first, &itm.grd, sizeof(GRID)) == 0);
-            if (seenItm->second <= moves) {
-                earlyCount++;
-                return;
-            }
-            seenItm->second = moves;
-        } else {
-            GRID *ngrid = gridPool.malloc();
-            memcpy(ngrid, &grd, sizeof(GRID));
-            seenBMap.insert(std::pair<GRID*,unsigned int>(ngrid, moves));
-        }
-#endif
-#if RETRACEUP & TRACKPARENTS
-        // Skip direct parent, since we had to do something to get here...
-        if (parent) {
-            AStarOpen *up = parent->parent;
-            while (up) {
-                if (memcmp(&itm.grd, &up->grd, sizeof(GRID)) == 0) {
-                    itm->decref();
-                    earlyCount++;
-                    return;
-                }
-                up = up->parent;
-            }
-        }
-#endif
-
-        AStarOpen *itm = nodePool.malloc();
-        powCount++;
-        copyGrid(grd, itm->grd);
-        //itm->dist = rCost;
-        itm->mindist = moves + minCost;
-        assert(itm->mindist < MAXCOST);
-        itm->moves = moves;
-        itm->refcount = 1;
-#if TRACKPARENTS
-        if (parent) {
-            parent->addref();
-            itm->parent = parent;
-        } else {
-            itm->parent = nullptr;
-        }
-#endif
-        openListX[minCost].push_back(itm);
-        if (minCost < lowOpenCost) {
-            lowOpenCost = minCost;
-        }
-    } else {
+    if (moves + minCost >= fastestFound) {
         earlyCount++;
+        return;
     }
+
+    if (wasGridSeen(grd, moves)) {
+        earlyCount++;
+        return;
+    }
+
+    AStarOpen *itm = nodePool.malloc();
+
+#pragma omp atomic
+    powCount++;
+
+    copyGrid(itm->grd, grd);
+    itm->mindist = minCost;
+    itm->moves = moves;
+    itm->refcount = 1;
+
+#if TRACKPARENTS
+    if (parent) {
+        parent->addref();
+        itm->parent = parent;
+    } else {
+        itm->parent = nullptr;
+    }
+#endif
+
+#if _OPENMP
+    tdata->newOpenList.push_back(itm);
+#else
+    openListX[minCost].push_back(itm);
+    if (minCost < lowOpenCost) {
+        lowOpenCost = minCost;
+    }
+#endif
 }
 
-unsigned int lasttick = 0;
 int addMoves(AStarOpen *owner) {
     GRID & in = owner->grd;
     int moves = owner->moves;
 
     testCount++;
+#if !_OPENMP
+
+    static unsigned int lasttick = 0;
     if (testCount % 10000 == 0) {
         unsigned int thistick = GetTickCount();
 
@@ -645,18 +541,20 @@ int addMoves(AStarOpen *owner) {
         }
         printf("[% 7d] tested %dk (%d best) [% 5dkmps %dk,%dk,%dk,%dk]\n", xtime(), testCount/1000, solutionCount?fastestFound:-1, kmps, powCount/1000, poofCount/1000, (powCount-poofCount)/1000, earlyCount/1000);
     }
+#endif
 
-    if (owner->mindist >= fastestFound) {
+    if (owner->moves + owner->mindist >= fastestFound) {
         return 3;
     }
 
     if (checkWin(in)) {
-        //recursePrintBoard(owner);
+        recursePrintBoard(owner);
         printf("[% 7d] Found winner using %d moves!\n", xtime(), moves);
+
         fastestFound = moves;
         solutionCount++;
 
-#if 1
+#if 0
         for (int z = 255; z >= fastestFound; --z) {
             for(OPENLISTGRP::iterator j = openListX[z].begin(); j != openListX[z].end(); ++j) {
                 (*j)->decref();
@@ -672,7 +570,7 @@ int addMoves(AStarOpen *owner) {
 
     for (int iy = 0; iy < 4; ++iy) {
         for (int ix = 0; ix < 6; ++ix) {
-            if (in[iy][ix] == 0) {
+            if (GE(in,iy,ix)) {
                 // Cell is empty, can't do anything
                 continue;
             }
@@ -681,7 +579,7 @@ int addMoves(AStarOpen *owner) {
             if (iy >= 1) {
                 if (GE(in,iy-1,ix) || GI(in,iy-1,ix) == GI(in,iy,ix)) {
                     // Move
-                    copyGrid(in, tgrd);
+                    copyGrid(tgrd, in);
                     moveItem(tgrd, ix, iy, ix, iy-1);
                     addToOpen(tgrd, owner->moves+1, owner);
                 }
@@ -691,7 +589,7 @@ int addMoves(AStarOpen *owner) {
             if (iy <= 2) {
                 if (GE(in,iy+1,ix) || GI(in,iy+1,ix) == GI(in,iy,ix)) {
                     // Move
-                    copyGrid(in, tgrd);
+                    copyGrid(tgrd, in);
                     moveItem(tgrd, ix, iy, ix, iy+1);
                     addToOpen(tgrd, owner->moves+1, owner);
                 }
@@ -701,7 +599,7 @@ int addMoves(AStarOpen *owner) {
             if (ix >= 1) {
                 if (GE(in,iy,ix-1) || GI(in,iy,ix-1) == GI(in,iy,ix)) {
                     // Move
-                    copyGrid(in, tgrd);
+                    copyGrid(tgrd, in);
                     moveItem(tgrd, ix, iy, ix-1, iy);
                     addToOpen(tgrd, owner->moves+1, owner);
                 }
@@ -711,7 +609,7 @@ int addMoves(AStarOpen *owner) {
             if (ix <= 4) {
                 if (GE(in,iy,ix+1) || GI(in,iy,ix+1) == GI(in,iy,ix)) {
                     // Move
-                    copyGrid(in, tgrd);
+                    copyGrid(tgrd, in);
                     moveItem(tgrd, ix, iy, ix+1, iy);
                     addToOpen(tgrd, owner->moves+1, owner);
                 }
@@ -723,6 +621,90 @@ int addMoves(AStarOpen *owner) {
 }
 
 void doSearch() {
+#if _OPENMP
+#pragma omp parallel
+    while(true) {
+        uint32_t batchTotal = 0;
+
+#pragma omp critical
+        {
+            // Merge everything back to global state, we do this to pull
+            //   anything added by the master thread in the beginning into
+            //   the global state
+            for (OPENLIST::iterator i = tdata->newOpenList.begin(); i != tdata->newOpenList.end(); ++i) {
+                openListX[(*i)->mindist].push_back(*i);
+                if ((*i)->mindist < lowOpenCost) {
+                    lowOpenCost = (*i)->mindist;
+                }
+            }
+            tdata->newOpenList.clear();
+
+            seenBMap.insert(tdata->seenList.begin(), tdata->seenList.end());
+            tdata->seenList.clear();
+
+            // Create a list of things for this thread
+            batchTotal = 0;
+            while (lowOpenCost < 256 && batchTotal < THREADBATCH) {
+                if (openListX[lowOpenCost].empty()) {
+                    lowOpenCost++;
+                    continue;
+                }
+
+                AStarOpen* itm = openListX[lowOpenCost].front();
+                openListX[lowOpenCost].pop_front();
+
+                tdata->curOpenList.push_back(itm);
+                batchTotal++;
+            }
+        }
+
+#pragma omp atomic
+        pendCount += batchTotal;
+
+        uint32_t curTime = GetTickCount();
+        if (curTime - lastStatus > 1000) {
+            lastStatus = curTime;
+            printf("[% 7d] tested %dk (%d best) [%dk %dk %dk %dk %dk]\n", 
+                xtime(),
+                testCount/1000,
+                solutionCount?fastestFound:-1,
+                powCount/1000,
+                poofCount/1000,
+                (powCount-poofCount)/1000,
+                earlyCount/1000,
+                pendCount/1000);
+        }
+
+        if (batchTotal == 0) {
+#if 0
+            printf("T%d ran out of items\n", omp_get_thread_num());
+            break;
+#else
+            if (pendCount == 0) {
+                break;
+            }
+            Sleep(10);
+            continue;
+#endif
+        }
+
+        //printf("[% 7d] T%d executing %d items\n", xtime(), omp_get_thread_num(), tdata->curOpenList.size());
+
+        while (!tdata->curOpenList.empty()) {
+            AStarOpen *itm = tdata->curOpenList.back();
+            tdata->curOpenList.pop_back();
+
+            addMoves(itm);
+            itm->decref();
+        }
+
+        //printf("[% 7d] T%d finished executing\n", xtime(), omp_get_thread_num());
+
+#pragma omp atomic
+        pendCount -= batchTotal;
+    }
+
+#else
     while (lowOpenCost < 256) {
         if (openListX[lowOpenCost].empty()) {
             lowOpenCost++;
@@ -735,27 +717,50 @@ void doSearch() {
         addMoves(itm);
         itm->decref();
     }
+#endif
 }
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-    buildTable();
+    omp_set_num_threads(omp_get_num_procs()-1);
 
     startTime = GetTickCount();
 
-    printf("TTL PLRS: %d\n", ttlPlyrs);
+    printf("ESTIMBEST: %d\n", ESTIMBEST);
+    printf("MAXCOST: %d\n", MAXCOST);
+    printf("TESTNUMBER: %d\n", TESTNUMBER);
+    printf("MAXPLRS: %d\n", MAXPLRS);
+    printf("MAXSTACK: %d\n", MAXSTACK);
+    printf("CULLBMAP: %d\n", CULLBMAP);
+    printf("_OPENMP: %d\n", _OPENMP);
+    printf("TTLPLAYRS: %d\n", TTLPLAYRS);
+
     printf("sizeof(GRID): %d\n", sizeof(GRID));
     printf("sizeof(AStarOpen): %d\n", sizeof(AStarOpen));
+    printf("sizeof(openListX): %d\n", sizeof(openListX));
     printf("\n");
 
-    printf("%d\n", checkWin(winTest));
-    printf("%d\n", checkWin(start));
-    //printf("%d\n", findClosestItem(distTest, 0, 2, 2, 4));
+    printf("checkWin(winTest): %d\n", checkWin(winTest));
+    printf("checkWin(start): %d\n", checkWin(start));
+    printf("\n");
+
+    buildTable();
+    printf("[% 7d] Cache Map Ready\n", xtime());
+
+#if _OPENMP
+#pragma omp parallel
+    tdata = new ThreadData();
+#endif
 
     addToOpen(start, 0, nullptr);
     doSearch();
+    printf("[% 7d] Completed! [%d %d %d %d]\n", xtime(), powCount, poofCount, powCount-poofCount, earlyCount);
 
-    printf("[% 7d] Completed! [%dk %dk %d]\n", xtime(), powCount/1000, poofCount/1000, powCount-poofCount);
+#if _OPENMP
+#pragma omp parallel
+    delete tdata;
+#endif
+
     system("PAUSE");
     return 0;
 }

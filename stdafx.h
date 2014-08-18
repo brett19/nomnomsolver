@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <tchar.h>
 #include <stdlib.h>
+#include <omp.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

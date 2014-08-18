@@ -22,7 +22,7 @@ GRID start = {
     {GV(0,0), GV(4,1), GV(5,1), GV(6,1), GV(0,0), GV(0,0)},
     {GV(0,0), GV(0,0), GV(0,0), GV(0,0), GV(0,0), GV(0,0)}
 };
-char i[][2][2] = {
+unsigned char i[][2][2] = {
     {{6,1}, {3,1}},
     {{4,1}, {2,1}}
 };
@@ -122,7 +122,7 @@ char i[][2][2] = {
     {{12,2}, {11,1}},
     {{10,3}, {12,2}}
 };
-#elif TESTNUMBER == 10 // ? - Real Level 5
+#elif TESTNUMBER == 10 // ? - Real Level 5 [21]
 GRID start = {
     {GV(5,1), GV(5,1), GV(0,0), GV(0,0), GV(5,1), GV(5,1)},
     {GV(6,1), GV(5,1), GV(1,1), GV(4,1), GV(5,1), GV(6,1)},
@@ -136,7 +136,7 @@ char i[][2][2] = {
 };
 #endif
 
-const int ttlPlyrs = sizeof(i) / sizeof(char[2][2]);
+const int TTLPLAYRS = sizeof(i) / sizeof(char[2][2]);
 
 GRID winTest = {
     {GV(1,1), GV(0,0), GV(0,0), GV(0,0), GV(0,0), GV(5,1)},
