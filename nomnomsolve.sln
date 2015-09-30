@@ -1,6 +1,8 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 2012
+# Visual Studio 2013
+VisualStudioVersion = 12.0.30723.0
+MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "nomnomsolve", "nomnomsolve.vcxproj", "{F1A489C7-26A8-427D-BF3C-12877AD69234}"
 EndProject
 Global
@@ -9,8 +11,6 @@ Global
 		Debug|x64 = Debug|x64
 		Release|Win32 = Release|Win32
 		Release|x64 = Release|x64
-		ReleaseX64|Win32 = ReleaseX64|Win32
-		ReleaseX64|x64 = ReleaseX64|x64
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{F1A489C7-26A8-427D-BF3C-12877AD69234}.Debug|Win32.ActiveCfg = Debug|Win32
@@ -21,10 +21,6 @@ Global
 		{F1A489C7-26A8-427D-BF3C-12877AD69234}.Release|Win32.Build.0 = Release|Win32
 		{F1A489C7-26A8-427D-BF3C-12877AD69234}.Release|x64.ActiveCfg = Release|x64
 		{F1A489C7-26A8-427D-BF3C-12877AD69234}.Release|x64.Build.0 = Release|x64
-		{F1A489C7-26A8-427D-BF3C-12877AD69234}.ReleaseX64|Win32.ActiveCfg = ReleaseX64|Win32
-		{F1A489C7-26A8-427D-BF3C-12877AD69234}.ReleaseX64|Win32.Build.0 = ReleaseX64|Win32
-		{F1A489C7-26A8-427D-BF3C-12877AD69234}.ReleaseX64|x64.ActiveCfg = ReleaseX64|x64
-		{F1A489C7-26A8-427D-BF3C-12877AD69234}.ReleaseX64|x64.Build.0 = ReleaseX64|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <omp.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+unsigned int hrTime();
+void sleepWait(unsigned int msecs);
 
 // TODO: reference additional headers your program requires here
